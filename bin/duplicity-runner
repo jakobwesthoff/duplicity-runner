@@ -1,0 +1,311 @@
+#!/bin/bash
+
+##
+# Copyright (c) 2010, Jakob Westhoff
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+#  1. Redistributions of source code must retain the above copyright notice,
+#  this list of conditions and the following disclaimer.
+# 
+#  2. Redistributions in binary form must reproduce the above copyright notice,
+#  this list of conditions and the following disclaimer in the documentation
+#  and/or other materials provided with the distribution.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+##
+
+##
+# Enable a stricter bash script processing to minimize errors in the code.
+##
+set -o nounset
+set -o errexit
+
+##
+# Location of the needed configuration files
+##
+BASE_CFG_DIR=/etc/duplicity-runner
+JOBS_CFG_DIR=${BASE_CFG_DIR}/jobs
+BASE_CFG_FILE=${BASE_CFG_DIR}/runner.cfg
+
+##
+# Default values for not specified commandline switches
+##
+QUIET_MODE=no
+
+##
+# Default options in case they are not specified in the config files
+##
+CHECK_TARGET_AVAILABILITY=no
+CHECK_TARGET_HOST=
+CHECK_TARGET_PORT=
+DUPLICITY_LOG_FILE=/var/log/duplicity.log
+DUPLICITY_LOG_VERBOSITY=5
+DEFAULT_CMD_OPTIONS=
+JOB_CMD_OPTIONS=
+LOCK_FILE_DIR=/var/run/duplicity-runner
+
+##
+# Output the given string to stderr
+##
+err() {
+	local text=${1}
+	echo "${1}" >&2
+}
+
+##
+# Output the given string only if quiet mode isn't enabled
+##
+out() {
+	[ "${QUIET_MODE}" == "yes" ] || echo "${1}"
+}
+
+##
+# Print out the commandline usage information
+##
+usage() {
+	err "Usage: $(basename "${0}") [-q] <job>"
+	err "Execute the backupjob named <job>."
+	err ""
+	err "The following jobs are currently defined:"
+	listAllJobs
+}
+
+##
+# Output a list of all currently available jobs
+##
+listAllJobs() {
+	local jobCount=0
+
+	local job=
+	for job in "${JOBS_CFG_DIR}"/*; do
+		[ -d "${job}" ] || continue
+		err "  * $(basename "${job}")"
+		let "jobCount = jobCount + 1"
+	done;
+	err "${jobCount} job(s) listed."
+}
+
+##
+# Determine if the number of arguments supplied on the commandline is valid to
+# run this script. If it is not display usage and exit with errorcode 1.
+##
+enforceArgumentCount() {
+	local actualArgumentCount=${1}
+	local neededArgumentCount=${2}
+
+	if [ ${actualArgumentCount} -ne ${neededArgumentCount} ]; then
+		usage
+		exit 1
+	fi
+}
+
+##
+# Ensure a job with the given name does exist and has a configuration file. If
+# it is not existant, show an error message and exit with errorcode 2
+##
+enforceJobExistance() {
+	local job="${1}"
+
+	local jobDir=${JOBS_CFG_DIR}/${job}
+
+	if [ ! -d "${jobDir}" ] || [ ! -f "${jobDir}/job.cfg" ]; then
+		err "The job '${job}' does either not exist or does not have a configuration file."
+		exit 2
+	fi
+}
+
+##
+# Source a given target file in secure way, by filtering out possible harmful
+# code and comments.
+#
+# Furthermore allow for options which are not enclosed in quotes, as well as
+# arbitrary whitespaces between option name equal sign and the option itself.
+##
+cleanSource() {
+	local uncleanTarget=${1}
+
+	local cleanTarget=$(tempfile)
+	trap "rm -f -- '${cleanTarget}'; exit" INT TERM EXIT # Automatic cleanup on error
+
+	set +e # Disable abort on error in case the file is empty after the grep
+	sed -e 's@^\([^ =]\+\)\s*=\s*\([^"'\'']*\)$@\1='\''\2'\''@' "${uncleanTarget}" | grep '^[^ ]\+=[^;&]*$' | grep -v '^#\|^[ \t]*$' >"${cleanTarget}"
+	set -e # Reenable abort on error
+
+	source "${cleanTarget}"
+	rm -f -- "${cleanTarget}"
+
+	trap - INT TERM EXIT # Automatic cleanup on error *END*
+}
+
+##
+# Create a bunch of commandline arguments from a line by line list inside a
+# given file
+# 
+# The given prefix will be prepended to every argument, after it has been
+# enclosed in single quotes
+# 
+# If the given file does not exist an empty string is returned
+##
+createCmdArgsFromFile() {
+	local prefix=${1}
+	local cmdFile=${2}
+	local line=
+
+	if [ -f "${cmdFile}" ]; then
+		cat "${cmdFile}" | grep -v '^#\|^[ \t]*$' | while read line; do
+			echo -ne "${prefix}${line}\n"
+		done;
+	else
+		echo -n ""
+	fi
+}
+
+##
+# Obtain a lock for the specified job
+#
+# If no lock file can be obtained, either because the job is already running or
+# the permissions on the lock file directory are wrong output a corresponding
+# error message and exit with errorcode 3
+#
+# Furthermore this function will register signal handler to cleanup the lock
+# files in case of a program termination.
+##
+lockJob() {
+	local job=${1}
+
+	local lockfile=${LOCK_FILE_DIR}/${job}.lock
+
+	if [ ! -d "${LOCK_FILE_DIR}" ]; then
+		if ! mkdir -- "${LOCK_FILE_DIR}" 2>&1 >/dev/null; then
+			err "Lock file directory does not exist and could not be created."
+			exit 3
+		fi
+	fi
+	
+	# Try to obtain lock in an atomic operation
+	if ( set -o noclobber; echo "$$" > "${lockfile}") 2> /dev/null; then
+   		trap "rm -f -- '${lockfile}'; exit" INT TERM EXIT
+	else
+		err "Could not aquire lock for job '${job}'."
+		err "The lock is currently held by pid: $(cat "${lockfile}")"
+		exit 3
+	fi 
+}
+
+##
+# Remove the lock for the given job
+#
+# This will remove the registered signal handler as well, as it is assumed only
+# one job is locked by one script at the same time.
+##
+unlockJob() {
+	local job=${1}
+
+	local lockfile=${LOCK_FILE_DIR}/${job}.lock
+
+	rm -f -- "${lockfile}"
+	trap - INT TERM EXIT
+}
+
+##
+# Check the availability of the target specified by the configuration.
+#
+# Netcat's -z option is used to determine if the given target service is
+# listening.
+#
+# In case the target service does not respond the an error will be shown and
+# the application will exit with errorcode 4
+##
+checkTargetAvailability() {
+	# Ensure host and port are specified
+	if [ -z "${CHECK_TARGET_HOST}" ] || [ -z "${CHECK_TARGET_PORT}" ]; then
+		err "CHECK_TARGET_AVAILABILITY enabled but no CHECK_TARGET_HOST or CHECK_TARGET_PORT provided."
+		err "A host as well as a port need to be specified to check backup target availability."
+		exit 4
+	fi
+
+	if ! nc -z "${CHECK_TARGET_HOST}" "${CHECK_TARGET_PORT}"; then
+		err "Target host '${CHECK_TARGET_HOST}' is not listening on port ${CHECK_TARGET_PORT}. Aborting."
+		exit 4
+	fi
+}
+
+##
+# Convert all whitespaces in the given string to newlines
+##
+toNL() {
+	local input="${1}"
+	echo -n "${input}"|tr " " "\n"
+}
+
+##
+# Main application entry point
+##
+
+# Check for quiet mode
+if [ $# -gt 1 ] && [ "${1}" == "-q" ]; then
+	QUIET_MODE=yes
+	shift
+fi
+
+out "duplicity-runner 0.1 (c) 2010 Jakob Westhoff"
+
+enforceArgumentCount $# 1
+
+job=${1}
+enforceJobExistance "${job}"
+
+out "Running job '${job}'"
+
+# Load the default configuration if it exists
+[ -f "${BASE_CFG_FILE}" ] && cleanSource "${BASE_CFG_FILE}"
+
+jobDir=${JOBS_CFG_DIR}/${job}
+jobCfg=${jobDir}/job.cfg
+jobExcludes=${jobDir}/excludes.cfg
+jobIncludes=${jobDir}/includes.cfg
+
+# Load the job configuration
+cleanSource "${jobCfg}"
+
+# Create the include and exclude commandline arguments
+includes=$(createCmdArgsFromFile "--include=" "${jobIncludes}")
+excludes=$(createCmdArgsFromFile "--exclude=" "${jobExcludes}")
+
+# Lock the selected job.
+out "Obtaining lock."
+lockJob "${job}"
+
+# Check for availability of the backup target if this check is enabled
+if [ "${CHECK_TARGET_AVAILABILITY}" == "yes" ]; then
+	out "Checking if backup target is available."
+	checkTargetAvailability
+fi
+
+out "Executing duplicity."
+# This escaping and transforming hell is needed to transport all the different
+# options, which may include spaces to duplicity as single arguments. Currently
+# I do not know a better way. If you know one, please contact me.
+#
+# Furthermore the log file format of duplicity is completely stupid. The stdout
+# will be logged instead.
+echo -e "$(toNL "${DEFAULT_CMD_OPTIONS}")\n$(toNL "${JOB_CMD_OPTIONS}")\n${includes}\n${excludes}\n-v${DUPLICITY_LOG_VERBOSITY}\n${BACKUP_SOURCE}\n${BACKUP_TARGET}"|grep -v "^$"|tr "\n" "\0"|xargs -0 duplicity 2>&1 >>"${DUPLICITY_LOG_FILE}"
+
+# Execution is finished release the job lock
+out "Releasing lock." 
+unlockJob "${job}"
+
+out "Everything done."
