@@ -86,3 +86,14 @@ output may be silenced by using the ``-q`` option::
 
 In this case only errors during execution will be outputted to STDERR. All
 status messages are effectively silenced this way.
+
+If no job name is specified a short help text as well as a list of all
+available backup jobs is display::
+
+    duplicity-runner 0.1 (c) 2010 Jakob Westhoff
+    Usage: duplicity-runner [-q] <job>
+    Execute the backupjob named <job>.
+
+    The following jobs are currently defined:
+      * example-job
+    1 job(s) listed.
